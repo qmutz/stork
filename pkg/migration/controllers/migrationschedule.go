@@ -29,6 +29,8 @@ import (
 const (
 	nameTimeSuffixFormat string = "2006-01-02-150405"
 	domainsRetryInterval        = 5 * time.Second
+	skipResource                = "stork.libopenstorage.org/skip-resource"
+	appsReplicas                = "stork.libopenstorage.org/replicas"
 	domainsMaxRetries           = 5
 )
 
@@ -118,7 +120,7 @@ func (m *MigrationScheduleController) handle(ctx context.Context, migrationSched
 				return err
 			}
 			migrationSchedule.Status.ApplicationActivated = isActivated
-			msg := fmt.Sprintf("Setting active statussince migrated apps on current cluster are active %v", isActivated)
+			msg := fmt.Sprintf("Setting AppActive status to: %v", isActivated)
 			m.recorder.Event(migrationSchedule,
 				v1.EventTypeWarning,
 				"AppsActivated",
@@ -169,6 +171,10 @@ func (m *MigrationScheduleController) handle(ctx context.Context, migrationSched
 				"Suspended",
 				msg)
 			log.MigrationScheduleLog(migrationSchedule).Warn(msg)
+			// deactivate apps in namespace
+			if _, err := deactivateApps(migrSched); err != nil {
+				return err
+			}
 			return m.client.Update(context.TODO(), migrationSchedule)
 		}
 	}
@@ -510,6 +516,60 @@ func getMigratedAppStatus(migrationSchedule *stork_api.MigrationSchedule) (bool,
 				logrus.Warnf("Deploy updated %v/%v", sts.Name, sts.Namespace)
 				return true, nil
 			}
+		}
+	}
+	// check rs status
+	return false, nil
+}
+
+// write in threads
+func deactivateApps(migrationSchedule *stork_api.MigrationSchedule) (bool, error) {
+	// check cr status
+	// check deploy status
+	//migrTime := migrationSchedule.GetAnnotations()[StorkMigrationTime]
+	for _, ns := range migrationSchedule.Spec.Template.Spec.Namespaces {
+		deployList, err := apps.Instance().ListDeployments(ns, meta.ListOptions{})
+		if err != nil {
+			return false, err
+		}
+		for _, deploy := range deployList.Items {
+			annot := deploy.GetAnnotations()
+			if annot != nil {
+				if _, ok := annot[skipResource]; ok {
+					continue
+				}
+			} else {
+				annot = make(map[string]string)
+			}
+			logrus.Debugf("scaling down deploy %v/%v", deploy.Namespace, deploy.Name)
+			annot[appsReplicas] = fmt.Sprintf("%v", *deploy.Spec.Replicas)
+			deploy.SetAnnotations(annot)
+			disable := int32(0)
+			deploy.Spec.Replicas = &disable
+			if _, err := apps.Instance().UpdateDeployment(&deploy); err != nil {
+				return false, err
+			}
+		}
+
+		// check statefulset status
+		stsList, err := apps.Instance().ListStatefulSets(ns, meta.ListOptions{LabelSelector: fmt.Sprintf("%v=%v", StorkMigrationAnnotation, "true")})
+		if err != nil {
+			return false, err
+		}
+		for _, sts := range stsList.Items {
+			annot := sts.GetAnnotations()
+			if annot != nil {
+				if _, ok := annot[skipResource]; ok {
+					continue
+				}
+			} else {
+				annot = make(map[string]string)
+			}
+			logrus.Debugf("scaling down sts %v/%v", sts.Name)
+			replicas := *sts.Spec.Replicas
+			annot[appsReplicas] = fmt.Sprintf("%v", replicas)
+			sts.SetAnnotations(annot)
+			replicas = 0
 		}
 	}
 	// check rs status
